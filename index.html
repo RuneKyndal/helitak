@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helitak Telemetry Engine</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#121212">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #121212;
+            color: #e0e0e0;
+            padding: 15px;
+            margin: 0;
+        }
+        h2 { color: #ffffff; text-align: center; margin-bottom: 5px; }
+        .status-box { text-align: center; color: #aaa; font-size: 14px; margin-bottom: 15px; padding: 8px; border-radius: 4px; background: #1a1a1a; }
+        .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+        button {
+            padding: 15px;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-start { background-color: #10b981; }
+        .btn-stop { background-color: #ef4444; }
+        .btn-export { background-color: #3b82f6; grid-column: span 2; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        #log-container { margin-top: 10px; }
+        .log-title { font-size: 14px; text-transform: uppercase; color: #888; letter-spacing: 1px; margin-bottom: 10px; }
+        .alert-item {
+            background-color: #1e293b;
+            border-left: 5px solid #3b82f6;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+        .alert-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
+        .alert-id { font-weight: bold; color: #60a5fa; }
+        .alert-type { font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; }
+        .type-boolean { background-color: #b45309; color: #fef3c7; }
+        .type-analog { background-color: #047857; color: #d1fae5; }
+        .alert-time { color: #888; font-size: 12px; }
+        .alert-values { font-family: monospace; font-size: 14px; background: #0f172a; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+        .label-input {
+            width: 100%;
+            padding: 8px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            border-radius: 4px;
+            box-sizing: border-box;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Helitak Mission Logger</h2>
+    <div id="status" class="status-box">PWA Engine Standby</div>
+
+    <div class="control-grid">
+        <button id="startBtn" class="btn-start" onclick="startScanning()">START SCAN</button>
+        <button id="stopBtn" class="btn-stop" onclick="stopScanning()" disabled>STOP</button>
+        <button id="exportBtn" class="btn-export" onclick="exportData()">EXPORT LOG FILE</button>
+    </div>
+
+    <div id="log-container">
+        <div class="log-title">Telemetry Stream</div>
+        <div id="log"></div>
+    </div>
+
+    <script>
+        // Register the offline Service Worker
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js').catch(()=>{});
+        }
+
+        const CONFIG = {
+            host: '192.168.1.3',
+            pageUrl: 'http://192.168.1.3/OPS/DevicesTank%2032%20Landscape',
+            handshakeUrl: 'http://192.168.1.3/socket.io/1/'
+        };
+
+        let knownValues = {};
+        let sessionLogs = [];
+        let ws = null;
+        let isRunning = false;
+        
+        let idLabels = JSON.parse(localStorage.getItem('helitak_labels') || '{}');
+        let idTypes = JSON.parse(localStorage.getItem('helitak_types') || '{}');
+
+        function updateStatus(text) {
+            document.getElementById('status').innerText = text;
+        }
+
+        function saveLabel(id, inputElement) {
+            idLabels[id] = inputElement.value;
+            localStorage.setItem('helitak_labels', JSON.stringify(idLabels));
+            sessionLogs.forEach(log => { if (log.id === id) log.label = inputElement.value; });
+        }
+
+        async function startScanning() {
+            isRunning = true;
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            updateStatus("Hitting HMI Interface...");
+            
+            try {
+                await fetch(CONFIG.pageUrl, { method: 'GET', mode: 'no-cors' });
+                const timestamp = Date.now();
+                const handshakeResponse = await fetch(`${CONFIG.handshakeUrl}?t=${timestamp}`);
+                const textData = await handshakeResponse.text();
+                const sid = textData.split(':')[0];
+
+                if (!sid) {
+                    updateStatus("Error: Handshake rejection.");
+                    stopScanning();
+                    return;
+                }
+
+                ws = new WebSocket(`ws://${CONFIG.host}/socket.io/1/websocket/${sid}`);
+
+                ws.onopen = () => {
+                    updateStatus("STREAM ACTIVE - RECORDING");
+                    ws.send("1::");
+                };
+
+                ws.onmessage = (event) => {
+                    if (!isRunning) return;
+                    const msg = event.data;
+                    if (msg === "2::") { ws.send("2::"); return; }
+                    if (msg.includes('5:::{"name":"data"')) { parseAndCompare(msg); }
+                };
+
+                ws.onclose = () => { if (isRunning) updateStatus("Stream closed."); };
+                ws.onerror = () => { updateStatus("Network connection fault."); };
+
+            } catch (err) {
+                updateStatus("HMI offline or out of range.");
+                stopScanning();
+            }
+        }
+
+        function stopScanning() {
+            isRunning = false;
+            if (ws) { ws.close(); ws = null; }
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            updateStatus("Session locked. Ready for export.");
+        }
+
+        function parseAndCompare(payload) {
+            try {
+                const jsonStart = payload.indexOf('[{"Id"');
+                const jsonEnd = payload.lastIndexOf('}]') + 2;
+                if (jsonStart === -1 || jsonEnd === -1) return;
+
+                const rawJsonArray = payload.substring(jsonStart, jsonEnd);
+                const dataItems = JSON.parse(rawJsonArray);
+                const logDiv = document.getElementById('log');
+
+                dataItems.forEach(item => {
+                    const id = item.Id;
+                    const value = parseInt(item.Value, 10);
+
+                    if (knownValues[id] === undefined) {
+                        knownValues[id] = value;
+                        return;
+                    }
+
+                    if (knownValues[id] !== value) {
+                        const timestamp = new Date().toLocaleTimeString();
+                        const currentLabel = idLabels[id] || "";
+                        
+                        if (idTypes[id] !== "ANALOG") {
+                            if (value === 0 || value === 1) {
+                                idTypes[id] = "BOOLEAN";
+                            } else {
+                                idTypes[id] = "ANALOG";
+                            }
+                            localStorage.setItem('helitak_types', JSON.stringify(idTypes));
+                        }
+
+                        sessionLogs.push({
+                            time: timestamp,
+                            id: id,
+                            dataType: idTypes[id],
+                            oldVal: knownValues[id],
+                            newVal: value,
+                            label: currentLabel
+                        });
+
+                        let existingRow = document.getElementById(`row-${id}`);
+                        if (existingRow) {
+                            existingRow.querySelector('.alert-values').innerHTML = `${knownValues[id]} &rarr; ${value}`;
+                            existingRow.querySelector('.alert-time').innerText = timestamp;
+                            
+                            const typeTag = existingRow.querySelector('.alert-type');
+                            typeTag.className = `alert-type type-${idTypes[id].toLowerCase()}`;
+                            typeTag.innerText = idTypes[id];
+
+                            logDiv.insertBefore(existingRow, logDiv.firstChild);
+                        } else {
+                            const html = `
+                                <div class="alert-item" id="row-${id}">
+                                    <div class="alert-header">
+                                        <span class="alert-id">ID: ${id}</span>
+                                        <div>
+                                            <span class="alert-type type-${idTypes[id].toLowerCase()}">${idTypes[id]}</span>
+                                            <span class="alert-time" style="margin-left: 8px;">${timestamp}</span>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <span class="alert-values">${knownValues[id]} &rarr; ${value}</span>
+                                    </div>
+                                    <input type="text" class="label-input" placeholder="Enter Name/Label..." 
+                                           value="${currentLabel}" oninput="saveLabel('${id}', this)">
+                                </div>
+                            `;
+                            logDiv.insertAdjacentHTML('afterbegin', html);
+                        }
+
+                        knownValues[id] = value;
+                    }
+                });
+            } catch (e) {}
+        }
+
+        function exportData() {
+            if (sessionLogs.length === 0) {
+                alert("No telemetry transitions caught inside this session.");
+                return;
+            }
+
+            let output = "=== HELITAK MISSION DISCOVERY FILE ===\r\n";
+            output += "Export Time: " + new Date().toLocaleString() + "\r\n";
+            output += "==================================================\r\n\r\n";
+
+            sessionLogs.forEach((log, index) => {
+                const tag = idLabels[log.id] || "UNKNOWN_ASSET";
+                output += "[" + log.time + "] ID:" + log.id + " | NAME:" + tag + " | TYPE:" + log.dataType + " | DELTA:" + log.oldVal + "->" + log.newVal + "\r\n";
+            });
+
+            const blob = new Blob([output], { type: 'text/plain;charset=utf-8' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = "helitak_telemetry_" + Date.now() + ".txt";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
