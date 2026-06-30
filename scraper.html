@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helitak HMI Scraper - Install</title>
+<style>
+  body { background:#0b0d0f; color:#e8e6df; font-family:-apple-system,Arial,sans-serif; padding:20px; line-height:1.6; max-width:640px; margin:0 auto; }
+  h1 { font-size:20px; font-weight:600; }
+  h2 { font-size:16px; font-weight:600; margin-top:28px; }
+  .steps { background:#15181b; border:1px solid #2a2e33; border-radius:10px; padding:16px; }
+  .steps ol { margin:0; padding-left:20px; }
+  .steps li { margin-bottom:10px; }
+  a.bookmarklet { display:inline-block; background:#d85a30; color:#fff; padding:10px 18px; border-radius:8px; text-decoration:none; font-weight:600; touch-action:none; }
+  code { background:#1d2024; padding:2px 6px; border-radius:4px; font-size:13px; }
+  textarea { width:100%; height:220px; background:#15181b; color:#9fe1cb; border:1px solid #2a2e33; border-radius:8px; padding:10px; font-family:monospace; font-size:11px; box-sizing:border-box; }
+  .warn { color:#f0997b; font-size:14px; }
+</style>
+</head>
+<body>
+
+<h1>Helitak HMI scraper - install</h1>
+<p>This runs as a <b>bookmarklet</b>, not a standalone app. Reason: the HMI's web server doesn't allow another page to read its files (CORS), so the scraper has to run <i>inside</i> the HMI's own page, which only works once you've actually navigated to it in Chrome.</p>
+
+<div class="steps">
+<h2>Setup (once)</h2>
+<ol>
+<li>Tap and hold the orange button below, then choose <b>"Add to Bookmarks"</b> (or copy the code in the box and create a new bookmark, pasting it as the URL).</li>
+<li>
+<p style="margin:8px 0"><a class="bookmarklet" id="bm" href="#">Helitak Scraper</a></p>
+</li>
+</ol>
+
+<h2>Each time you use it</h2>
+<ol>
+<li>Connect your phone to Wi-Fi <code>Helitak Tank</code>.</li>
+<li>In Chrome, go to <code>http://192.168.1.3/</code> (or any specific page, e.g. the Tank 32 Landscape screen, or IO RemoteL).</li>
+<li>Open the address bar, type <code>h</code> or whatever shortcut text you gave the bookmark, and tap it to run it. A small dark panel appears over the page.</li>
+<li>Tap <b>Start crawl</b> - it follows same-origin links, downloads every page/css/js/image it can reach, and lists them live.</li>
+<li>Optionally tap <b>Capture live data (10s)</b> on a page that streams socket.io data, to grab a slice of raw payloads into the export too.</li>
+<li>Type any manual notes/observations into the notes box.</li>
+<li>Tap <b>Export ZIP</b> - downloads everything as one .zip to your phone's Downloads folder.</li>
+<li>Upload that .zip back to me here.</li>
+</ol>
+</div>
+
+<p class="warn">If "Add to Bookmarks" on long-press doesn't work on your phone, use the fallback: copy the text from the box below, create a new bookmark manually (Chrome menu &rarr; Bookmarks &rarr; add), and paste this whole thing as the URL field.</p>
+
+<textarea id="src" readonly></textarea>
+
+<script>
+// ---- The actual scraper, packaged as a javascript: bookmarklet ----
+const scraperSource = function() {
+  if (window.__helitakScraperRunning) { return; }
+  window.__helitakScraperRunning = true;
+
+  const origin = location.origin;
+  const visited = new Set();
+  const queue = [];
+  const files = new Map(); // path -> {blob, isText, text}
+  const logLines = [];
+  let liveCaptureLines = [];
+  let capturing = false;
+
+  // ---------- UI ----------
+  const panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed;top:8px;right:8px;width:300px;max-height:90vh;overflow:auto;background:#10131a;color:#e8e6df;font:12px/1.4 monospace;z-index:999999999;border:1px solid #444;border-radius:10px;padding:10px;box-shadow:0 4px 20px rgba(0,0,0,.6)';
+  panel.innerHTML = `
+    <div style="font-weight:bold;font-size:13px;margin-bottom:6px">Helitak HMI Scraper</div>
+    <div style="margin-bottom:6px">
+      <button id="hk-start" style="padding:6px 10px;margin-right:4px">Start crawl</button>
+      <button id="hk-capture" style="padding:6px 10px;margin-right:4px">Capture live data (10s)</button>
+    </div>
+    <div id="hk-status" style="margin-bottom:6px;color:#9fe1cb">Idle.</div>
+    <div id="hk-log" style="height:140px;overflow:auto;background:#000;padding:4px;border-radius:6px;margin-bottom:6px;white-space:pre-wrap"></div>
+    <textarea id="hk-notes" placeholder="Notes / observed values..." style="width:100%;height:70px;background:#000;color:#fc7;border:1px solid #333;border-radius:6px;padding:4px;box-sizing:border-box"></textarea>
+    <div style="margin-top:6px">
+      <button id="hk-export" style="padding:6px 10px;margin-right:4px">Export ZIP</button>
+      <button id="hk-close" style="padding:6px 10px">Close</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const statusEl = panel.querySelector('#hk-status');
+  const logEl = panel.querySelector('#hk-log');
+  function log(msg) {
+    logLines.push(msg);
+    logEl.textContent = logLines.slice(-200).join('\n');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  panel.querySelector('#hk-close').onclick = () => {
+    panel.remove();
+    window.__helitakScraperRunning = false;
+  };
+
+  // ---------- Crawl ----------
+  function isSameOrigin(url) {
+    try { return new URL(url, location.href).origin === origin; } catch (e) { return false; }
+  }
+
+  function pathFor(url) {
+    const u = new URL(url, location.href);
+    let p = u.pathname + (u.search || '');
+    if (p.endsWith('/')) p += 'index.html';
+    return p.replace(/^\//, '');
+  }
+
+  async function fetchAndStore(url) {
+    const path = pathFor(url);
+    if (files.has(path)) return null;
+    try {
+      const res = await fetch(url, { credentials: 'omit' });
+      const ct = res.headers.get('content-type') || '';
+      const isText = /text|javascript|json|html|css|xml/.test(ct) || /\.(html|js|css|json|txt)(\?|$)/i.test(url);
+      if (isText) {
+        const text = await res.text();
+        files.set(path, { isText: true, text });
+        return { path, isText: true, text };
+      } else {
+        const blob = await res.blob();
+        files.set(path, { isText: false, blob });
+        return { path, isText: false, blob };
+      }
+    } catch (e) {
+      log('FAIL ' + url + ' :: ' + e.message);
+      return null;
+    }
+  }
+
+  function extractLinks(html, baseUrl) {
+    const found = new Set();
+    const attrRe = /(?:href|src)\s*=\s*["']([^"']+)["']/gi;
+    let m;
+    while ((m = attrRe.exec(html))) {
+      try {
+        const abs = new URL(m[1], baseUrl).href;
+        if (isSameOrigin(abs) && !abs.includes('#')) found.add(abs.split('#')[0]);
+      } catch (e) {}
+    }
+    return Array.from(found);
+  }
+
+  async function crawl(startUrl, maxPages) {
+    queue.push(startUrl);
+    visited.add(startUrl);
+    let count = 0;
+    while (queue.length && count < maxPages) {
+      const url = queue.shift();
+      count++;
+      setStatus('Fetching (' + count + '/' + maxPages + '): ' + url.replace(origin, ''));
+      const result = await fetchAndStore(url);
+      log((result ? 'OK   ' : 'SKIP ') + url.replace(origin, ''));
+      if (result && result.isText && /html/i.test(result.text.slice(0, 200)) || (result && result.isText && url.match(/\.html?(\?|$)/i))) {
+        const links = extractLinks(result.text, url);
+        for (const l of links) {
+          if (!visited.has(l) && /\.(html?|js|css|png|jpg|jpeg|gif|svg|json|woff|ttf)(\?|$)/i.test(l) || !/\.[a-z0-9]{2,5}$/i.test(l)) {
+            if (!visited.has(l)) { visited.add(l); queue.push(l); }
+          }
+        }
+      } else if (result && result.isText) {
+        // js/css files can also reference more assets (url(...), fetch paths)
+        const links = extractLinks(result.text, url);
+        for (const l of links) {
+          if (!visited.has(l)) { visited.add(l); queue.push(l); }
+        }
+      }
+    }
+    setStatus('Crawl complete: ' + files.size + ' files captured.');
+    log('=== Crawl complete: ' + files.size + ' files ===');
+  }
+
+  panel.querySelector('#hk-start').onclick = () => {
+    log('Starting crawl from ' + location.href);
+    crawl(location.href, 60);
+  };
+
+  // ---------- Live socket.io capture ----------
+  panel.querySelector('#hk-capture').onclick = () => {
+    if (capturing) return;
+    capturing = true;
+    liveCaptureLines = [];
+    setStatus('Capturing live socket data for 10s...');
+    log('=== Starting live capture ===');
+
+    const handshakeUrl = origin + '/socket.io/1/?t=' + Date.now();
+    fetch(handshakeUrl).then(r => r.text()).then(body => {
+      liveCaptureLines.push('[handshake] ' + body);
+      const sid = body.split(':')[0];
+      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = wsProto + '://' + location.host + '/socket.io/1/websocket/' + sid;
+      const ws = new WebSocket(wsUrl);
+      ws.onopen = () => {
+        ws.send('1::');
+        liveCaptureLines.push('[' + new Date().toISOString() + '] OPEN');
+      };
+      ws.onmessage = (ev) => {
+        const msg = ev.data;
+        if (msg === '2::') { ws.send('2::'); return; }
+        liveCaptureLines.push('[' + new Date().toISOString() + '] ' + msg);
+        log('LIVE: ' + msg.slice(0, 80));
+      };
+      ws.onerror = (e) => log('WS error');
+      setTimeout(() => {
+        ws.close();
+        capturing = false;
+        setStatus('Live capture done: ' + liveCaptureLines.length + ' lines.');
+        log('=== Live capture done ===');
+      }, 10000);
+    }).catch(e => {
+      log('Handshake failed: ' + e.message);
+      capturing = false;
+    });
+  };
+
+  // ---------- Export ----------
+  panel.querySelector('#hk-export').onclick = async () => {
+    setStatus('Loading zip library...');
+    if (!window.JSZip) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+    setStatus('Building zip...');
+    const zip = new JSZip();
+    for (const [path, data] of files.entries()) {
+      if (data.isText) zip.file(path, data.text);
+      else zip.file(path, data.blob);
+    }
+    const notes = panel.querySelector('#hk-notes').value;
+    let notesOut = '=== Crawl log ===\n' + logLines.join('\n') + '\n\n';
+    notesOut += '=== Manual notes ===\n' + notes + '\n\n';
+    if (liveCaptureLines.length) {
+      notesOut += '=== Live socket capture ===\n' + liveCaptureLines.join('\n') + '\n';
+    }
+    zip.file('notes.txt', notesOut);
+
+    setStatus('Generating download...');
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'helitak_scrape_' + Date.now() + '.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setStatus('Exported ' + files.size + ' files as zip.');
+    log('=== Export complete ===');
+  };
+};
+
+const bookmarkletUrl = 'javascript:(' + scraperSource.toString() + ')();';
+document.getElementById('bm').href = bookmarkletUrl;
+document.getElementById('src').value = bookmarkletUrl;
+</script>
+
+</body>
+</html>
